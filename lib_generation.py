@@ -1,0 +1,732 @@
+# Based on the code of Kimin Lee (Sun Oct 21 2018)
+from __future__ import print_function
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+
+from torch.autograd import Variable
+from scipy.spatial.distance import pdist, cdist, squareform
+
+# lid of a batch of query points X
+def mle_batch(data, batch, k):
+    '''
+    commpute lid score using data & batch with k-neighbors
+    return: a: computed LID score
+    '''
+    data = np.asarray(data, dtype=np.float32)
+    batch = np.asarray(batch, dtype=np.float32)
+
+    k = min(k, len(data)-1)
+    f = lambda v: - k / np.sum(np.log(v/v[-1]))
+    a = cdist(batch, data)
+    a = np.apply_along_axis(np.sort, axis=1, arr=a)[:,1:k+1]
+    a = np.apply_along_axis(f, axis=1, arr=a)
+    return a
+
+# this function is from https://github.com/xingjunm/lid_adversarial_subspace_detection
+def merge_and_generate_labels(X_pos, X_neg):
+    """
+    merge positve and nagative artifact and generate labels
+    return: X: merged samples, 2D ndarray
+             y: generated labels (0/1): 2D ndarray same size as X
+    """
+    X_pos = np.asarray(X_pos, dtype=np.float32)
+    X_pos = X_pos.reshape((X_pos.shape[0], -1))
+
+    X_neg = np.asarray(X_neg, dtype=np.float32)
+    X_neg = X_neg.reshape((X_neg.shape[0], -1))
+
+    X = np.concatenate((X_pos, X_neg))
+    y = np.concatenate((np.ones(X_pos.shape[0]), np.zeros(X_neg.shape[0])))
+    y = y.reshape((X.shape[0], 1))
+
+    return X, y
+
+def sample_estimator(model, num_classes, feature_list, train_loader):
+    """
+    compute sample mean and precision (inverse of covariance)
+    return: sample_class_mean: list of class mean
+             precision: list of precisions
+    """
+    import sklearn.covariance
+    
+    model.eval()
+    group_lasso = sklearn.covariance.EmpiricalCovariance(assume_centered=False)
+    correct, total = 0, 0
+    num_output = len(feature_list)
+    num_sample_per_class = np.empty(num_classes)
+    num_sample_per_class.fill(0)
+    list_features = []
+    for i in tqdm(range(num_output)):
+        temp_list = []
+        for j in range(num_classes):
+            temp_list.append(0)
+        list_features.append(temp_list)
+    
+    for data, target in tqdm(train_loader):
+        total += data.size(0)
+        data = data.cuda()
+        data = Variable(data, volatile=True)
+        output, out_features = model.feature_list(data)
+        
+        # get hidden features
+        for i in range(num_output):
+            out_features[i] = out_features[i].view(out_features[i].size(0), out_features[i].size(1), -1)
+            out_features[i] = torch.mean(out_features[i].data, 2)
+            
+        # compute the accuracy
+        pred = output.data.max(1)[1]
+        equal_flag = pred.eq(target.cuda()).cpu()
+        correct += equal_flag.sum()
+        
+        # construct the sample matrix
+        for i in range(data.size(0)):
+            label = target[i]
+            if num_sample_per_class[label] == 0:
+                out_count = 0
+                for out in out_features:
+                    list_features[out_count][label] = out[i].view(1, -1)
+                    out_count += 1
+            else:
+                out_count = 0
+                for out in out_features:
+                    list_features[out_count][label] \
+                    = torch.cat((list_features[out_count][label], out[i].view(1, -1)), 0)
+                    out_count += 1                
+            num_sample_per_class[label] += 1
+            
+    sample_class_mean = []
+    out_count = 0
+    for num_feature in feature_list:
+        temp_list = torch.Tensor(num_classes, int(num_feature)).cuda()
+        for j in range(num_classes):
+            temp_list[j] = torch.mean(list_features[out_count][j], 0)
+        sample_class_mean.append(temp_list)
+        out_count += 1
+        
+    precision = []
+    for k in range(num_output):
+        X = 0
+        for i in range(num_classes):
+            if i == 0:
+                X = list_features[k][i] - sample_class_mean[k][i]
+            else:
+                X = torch.cat((X, list_features[k][i] - sample_class_mean[k][i]), 0)
+                
+        # find inverse            
+        group_lasso.fit(X.cpu().numpy())
+        temp_precision = group_lasso.precision_
+        temp_precision = torch.from_numpy(temp_precision).float().cuda()
+        precision.append(temp_precision)
+        
+    print('\n Training Accuracy:({:.2f}%)\n'.format(100. * correct / total))
+
+    return sample_class_mean, precision
+
+def get_Mahalanobis_score(model, test_loader, num_classes, outf, out_flag, net_type, sample_mean, precision, layer_index, magnitude):
+    '''
+    Compute the proposed Mahalanobis confidence score on input dataset
+    return: Mahalanobis score from layer_index
+    '''
+    model.eval()
+    Mahalanobis = []
+    
+    if out_flag == True:
+        temp_file_name = '%s/confidence_Ga%s_In.txt'%(outf, str(layer_index))
+    else:
+        temp_file_name = '%s/confidence_Ga%s_Out.txt'%(outf, str(layer_index))
+        
+    g = open(temp_file_name, 'w')
+    
+    for data, target in test_loader:
+        
+        data, target = data.cuda(), target.cuda()
+        data, target = Variable(data, requires_grad = True), Variable(target)
+        
+        out_features = model.intermediate_forward(data, layer_index)
+        out_features = out_features.view(out_features.size(0), out_features.size(1), -1)
+        out_features = torch.mean(out_features, 2)
+        
+        # compute Mahalanobis score
+        gaussian_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_mean[layer_index][i]
+            zero_f = out_features.data - batch_sample_mean
+            term_gau = -0.5*torch.mm(torch.mm(zero_f, precision[layer_index]), zero_f.t()).diag()
+            if i == 0:
+                gaussian_score = term_gau.view(-1,1)
+            else:
+                gaussian_score = torch.cat((gaussian_score, term_gau.view(-1,1)), 1)
+        
+        # Input_processing
+        print("gaussian score shape : ", gaussian_score.shape)
+        sample_pred = gaussian_score.max(1)[1]
+        print("sample_pred shape : ", sample_pred.shape)
+        print("sample mean layer_index shape : ",sample_mean[layer_index].shape)
+        batch_sample_mean = sample_mean[layer_index].index_select(0, sample_pred)
+        zero_f = out_features - Variable(batch_sample_mean)
+        print("zerof shape : ", zero_f.shape)
+        print("precision layer_index shape : ",precision[layer_index].shape)
+        pure_gau = -0.5*torch.mm(torch.mm(zero_f, Variable(precision[layer_index])), zero_f.t()).diag()
+        loss = torch.mean(-pure_gau)
+        loss.backward()
+         
+        gradient =  torch.ge(data.grad.data, 0)
+        gradient = (gradient.float() - 0.5) * 2
+        if net_type == 'densenet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (63.0/255.0))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (62.1/255.0))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (66.7/255.0))
+        elif net_type == 'resnet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (0.2023))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (0.1994))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (0.2010))
+        tempInputs = torch.add(data.data, -magnitude, gradient)
+ 
+        noise_out_features = model.intermediate_forward(Variable(tempInputs, volatile=True), layer_index)
+        noise_out_features = noise_out_features.view(noise_out_features.size(0), noise_out_features.size(1), -1)
+        noise_out_features = torch.mean(noise_out_features, 2)
+        noise_gaussian_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_mean[layer_index][i]
+            zero_f = noise_out_features.data - batch_sample_mean
+            term_gau = -0.5*torch.mm(torch.mm(zero_f, precision[layer_index]), zero_f.t()).diag()
+            if i == 0:
+                noise_gaussian_score = term_gau.view(-1,1)
+            else:
+                noise_gaussian_score = torch.cat((noise_gaussian_score, term_gau.view(-1,1)), 1)      
+
+        noise_gaussian_score, _ = torch.max(noise_gaussian_score, dim=1)
+        Mahalanobis.extend(noise_gaussian_score.cpu().numpy())
+        
+        for i in range(data.size(0)):
+            g.write("{}\n".format(noise_gaussian_score[i]))
+    g.close()
+
+    return Mahalanobis
+
+from sklearn.mixture import GaussianMixture
+import torch
+from torch.autograd import Variable
+import numpy as np
+from tqdm import tqdm
+
+def sample_estimator_gmm(model, num_classes, feature_list, train_loader, num_components=3):
+    """
+    Compute sample mean and precision using GMM.
+    Returns:
+        sample_class_mean: list of class mean from GMM
+        precisions: list of precisions from GMM components
+    """
+    model.eval()
+    correct, total = 0, 0
+    num_output = len(feature_list)
+    num_sample_per_class = np.zeros(num_classes)
+    list_features = [[] for _ in range(num_output)]
+
+    # Prepare features by class
+    for data, target in tqdm(train_loader):
+        total += data.size(0)
+        data = data.cuda()
+        data = Variable(data, volatile=True)
+        output, out_features = model.feature_list(data)
+
+        # Process hidden features
+        for i in range(num_output):
+            out_features[i] = out_features[i].view(out_features[i].size(0), out_features[i].size(1), -1)
+            out_features[i] = torch.mean(out_features[i].data, 2)
+
+        # Compute accuracy
+        pred = output.data.max(1)[1]
+        equal_flag = pred.eq(target.cuda()).cpu()
+        correct += equal_flag.sum()
+
+        # Collect features by class
+        for i in range(data.size(0)):
+            label = target[i]
+            num_sample_per_class[label] += 1
+            for out_idx, out in enumerate(out_features):
+                if len(list_features[out_idx]) <= label:
+                    list_features[out_idx].append(out[i].view(1, -1))
+                else:
+                    list_features[out_idx][label] = torch.cat((list_features[out_idx][label], out[i].view(1, -1)), 0)
+
+    # Use GMM to estimate means and precisions
+    sample_class_mean = []
+    precisions = []
+    for out_idx, num_feature in tqdm(enumerate(feature_list)):
+        class_means = []
+        class_precisions = []
+        for class_idx in range(num_classes):
+            # Fit GMM for each class and layer
+            gmm = GaussianMixture(n_components=num_components, covariance_type='full', random_state=0)
+            gmm.fit(list_features[out_idx][class_idx].cpu().numpy())
+            class_means.append(torch.tensor(gmm.means_, device="cuda").float())
+            class_precisions.append(torch.inverse(torch.tensor(gmm.covariances_, device="cuda").float()))
+
+        sample_class_mean.append(class_means)
+        precisions.append(class_precisions)
+
+    print('\n Training Accuracy:({:.2f}%)\n'.format(100. * correct / total))
+    return sample_class_mean, precisions
+
+import torch
+from torch.autograd import Variable
+
+def get_Mahalanobis_score_gmm(model, test_loader, num_classes, outf, out_flag, net_type, sample_mean, precision, layer_index, magnitude, num_components=3):
+    """
+    Compute the Mahalanobis confidence score on input dataset using GMM.
+    Returns: Mahalanobis score from layer_index.
+    """
+    model.eval()
+    Mahalanobis = []
+    
+    # Determine file name for confidence scores
+    temp_file_name = '%s/confidence_gmm_Ga%s_%s.txt' % (
+        outf, str(layer_index), "In" if not out_flag else "Out"
+    )
+    
+    g = open(temp_file_name, 'w')
+    
+    for data, target in tqdm(test_loader):
+        data, target = data.cuda(), target.cuda()
+        data, target = Variable(data, requires_grad=True), Variable(target)
+        
+        # Forward pass to get intermediate features at specified layer
+        out_features = model.intermediate_forward(data, layer_index)
+        out_features = out_features.view(out_features.size(0), out_features.size(1), -1)
+        out_features = torch.mean(out_features, 2)
+        
+        # Compute Mahalanobis score using GMM
+        gaussian_score = 0
+        for class_idx in range(num_classes):
+            # Store min distance per class by iterating over GMM components
+            component_scores = []
+            for comp_idx in range(num_components):
+                batch_sample_mean = sample_mean[layer_index][class_idx][comp_idx]
+                zero_f = out_features.data - batch_sample_mean
+                term_gau = -0.5 * torch.mm(
+                    torch.mm(zero_f, precision[layer_index][class_idx][comp_idx]),
+                    zero_f.t()
+                ).diag()
+                component_scores.append(term_gau.view(-1, 1))
+            # Choose the minimum distance across components
+            min_score_per_class = torch.min(torch.cat(component_scores, dim=1), dim=1)[0]
+            if class_idx == 0:
+                gaussian_score = min_score_per_class.view(-1, 1)
+            else:
+                gaussian_score = torch.cat((gaussian_score, min_score_per_class.view(-1, 1)), 1) if class_idx > 0 else min_score_per_class.view(-1, 1)
+        
+        # Input processing: Get the class with the highest Mahalanobis score
+        sample_pred = gaussian_score.max(1)[1]
+        batch_sample_mean = torch.stack([
+            sample_mean[layer_index][c][0] for c in sample_pred
+        ])
+        zero_f = out_features - Variable(batch_sample_mean)
+        
+        # Compute pure Gaussian score and gradients
+        pure_gau = -0.5 * torch.mm(
+            torch.mm(zero_f, Variable(precision[layer_index][0][0])),
+            zero_f.t()
+        ).diag()
+        loss = torch.mean(-pure_gau)
+        loss.backward()
+        
+        # Apply gradients to original data
+        gradient = torch.ge(data.grad.data, 0).float().sub(0.5).mul(2)
+        if net_type == 'densenet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (63.0 / 255.0))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (62.1 / 255.0))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (66.7 / 255.0))
+        elif net_type == 'resnet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / 0.2023)
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / 0.1994)
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / 0.2010)
+        
+        tempInputs = torch.add(data.data, -magnitude, gradient)
+        
+        # Compute Mahalanobis score on perturbed data
+        noise_out_features = model.intermediate_forward(Variable(tempInputs, volatile=True), layer_index)
+        noise_out_features = noise_out_features.view(noise_out_features.size(0), noise_out_features.size(1), -1)
+        noise_out_features = torch.mean(noise_out_features, 2)
+        
+        noise_gaussian_score = 0
+        for class_idx in range(num_classes):
+            component_scores = []
+            for comp_idx in range(num_components):
+                batch_sample_mean = sample_mean[layer_index][class_idx][comp_idx]
+                zero_f = noise_out_features.data - batch_sample_mean
+                term_gau = -0.5 * torch.mm(
+                    torch.mm(zero_f, precision[layer_index][class_idx][comp_idx]),
+                    zero_f.t()
+                ).diag()
+                component_scores.append(term_gau.view(-1, 1))
+            # Select the minimum score per class
+            min_score_per_class = torch.min(torch.cat(component_scores, dim=1), dim=1)[0]
+            noise_gaussian_score = torch.cat((noise_gaussian_score, min_score_per_class.view(-1, 1)), 1) if class_idx > 0 else min_score_per_class.view(-1, 1)
+        
+        # Store and write scores
+        noise_gaussian_score, _ = torch.max(noise_gaussian_score, dim=1)
+        Mahalanobis.extend(noise_gaussian_score.cpu().numpy())
+        
+        for score in noise_gaussian_score:
+            g.write(f"{score.item()}\n")
+    
+    g.close()
+    return Mahalanobis
+
+def get_posterior(model, net_type, test_loader, magnitude, temperature, outf, out_flag):
+    '''
+    Compute the maximum value of (processed) posterior distribution - ODIN
+    return: null
+    '''
+    criterion = nn.CrossEntropyLoss()
+    model.eval()
+    total = 0
+    if out_flag == True:
+        temp_file_name_val = '%s/confidence_PoV_In.txt'%(outf)
+        temp_file_name_test = '%s/confidence_PoT_In.txt'%(outf)
+    else:
+        temp_file_name_val = '%s/confidence_PoV_Out.txt'%(outf)
+        temp_file_name_test = '%s/confidence_PoT_Out.txt'%(outf)
+        
+    g = open(temp_file_name_val, 'w')
+    f = open(temp_file_name_test, 'w')
+    
+    for data, _ in test_loader:
+        total += data.size(0)
+        data = data.cuda()
+        data = Variable(data, requires_grad = True)
+        batch_output = model(data)
+            
+        # temperature scaling
+        outputs = batch_output / temperature
+        labels = outputs.data.max(1)[1]
+        labels = Variable(labels)
+        loss = criterion(outputs, labels)
+        loss.backward()
+         
+        # Normalizing the gradient to binary in {0, 1}
+        gradient =  torch.ge(data.grad.data, 0)
+        gradient = (gradient.float() - 0.5) * 2
+        if net_type == 'densenet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (63.0/255.0))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (62.1/255.0))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (66.7/255.0))
+        elif net_type == 'resnet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (0.2023))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (0.1994))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (0.2010))
+
+        tempInputs = torch.add(data.data,  -magnitude, gradient)
+        outputs = model(Variable(tempInputs, volatile=True))
+        outputs = outputs / temperature
+        soft_out = F.softmax(outputs, dim=1)
+        soft_out, _ = torch.max(soft_out.data, dim=1)
+        
+        for i in range(data.size(0)):
+            if total <= 1000:
+                g.write("{}\n".format(soft_out[i]))
+            else:
+                f.write("{}\n".format(soft_out[i]))
+                
+    f.close()
+    g.close()
+    
+def get_Mahalanobis_score_adv(model, test_data, test_label, num_classes, outf, net_type, sample_mean, precision, layer_index, magnitude):
+    '''
+    Compute the proposed Mahalanobis confidence score on adversarial samples
+    return: Mahalanobis score from layer_index
+    '''
+    model.eval()
+    Mahalanobis = []
+    batch_size = 50#100
+    total = 0
+    
+    for data_index in range(int(np.floor(test_data.size(0)/batch_size))):
+        target = test_label[total : total + batch_size].cuda()
+        data = test_data[total : total + batch_size].cuda()
+        total += batch_size
+        data, target = Variable(data, requires_grad = True), Variable(target)
+        
+        out_features = model.intermediate_forward(data, layer_index)
+        out_features = out_features.view(out_features.size(0), out_features.size(1), -1)
+        out_features = torch.mean(out_features, 2)
+        
+        gaussian_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_mean[layer_index][i]
+            zero_f = out_features.data - batch_sample_mean
+            term_gau = -0.5*torch.mm(torch.mm(zero_f, precision[layer_index]), zero_f.t()).diag()
+            if i == 0:
+                gaussian_score = term_gau.view(-1,1)
+            else:
+                gaussian_score = torch.cat((gaussian_score, term_gau.view(-1,1)), 1)
+        
+        # Input_processing
+        sample_pred = gaussian_score.max(1)[1]
+        batch_sample_mean = sample_mean[layer_index].index_select(0, sample_pred)
+        zero_f = out_features - Variable(batch_sample_mean)
+        pure_gau = -0.5*torch.mm(torch.mm(zero_f, Variable(precision[layer_index])), zero_f.t()).diag()
+        loss = torch.mean(-pure_gau)
+        loss.backward()
+         
+        gradient =  torch.ge(data.grad.data, 0)
+        gradient = (gradient.float() - 0.5) * 2
+        if net_type == 'densenet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (63.0/255.0))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (62.1/255.0))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (66.7/255.0))
+        elif net_type == 'resnet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (0.2023))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (0.1994))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (0.2010))
+        tempInputs = torch.add(data.data, -magnitude, gradient)
+ 
+        noise_out_features = model.intermediate_forward(Variable(tempInputs, volatile=True), layer_index)
+        noise_out_features = noise_out_features.view(noise_out_features.size(0), noise_out_features.size(1), -1)
+        noise_out_features = torch.mean(noise_out_features, 2)
+        noise_gaussian_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_mean[layer_index][i]
+            zero_f = noise_out_features.data - batch_sample_mean
+            term_gau = -0.5*torch.mm(torch.mm(zero_f, precision[layer_index]), zero_f.t()).diag()
+            if i == 0:
+                noise_gaussian_score = term_gau.view(-1,1)
+            else:
+                noise_gaussian_score = torch.cat((noise_gaussian_score, term_gau.view(-1,1)), 1)      
+
+        noise_gaussian_score, _ = torch.max(noise_gaussian_score, dim=1)
+        Mahalanobis.extend(noise_gaussian_score.cpu().numpy())
+        
+    return Mahalanobis
+
+
+def get_LID(model, test_clean_data, test_adv_data, test_noisy_data, test_label, num_output):
+    '''
+    Compute LID score on adversarial samples
+    return: LID score
+    '''
+    model.eval()  
+    total = 0
+    batch_size = 100
+    
+    LID, LID_adv, LID_noisy = [], [], []    
+    overlap_list = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+    for i in overlap_list:
+        LID.append([])
+        LID_adv.append([])
+        LID_noisy.append([])
+        
+    for data_index in range(int(np.floor(test_clean_data.size(0)/batch_size))):
+        data = test_clean_data[total : total + batch_size].cuda()
+        adv_data = test_adv_data[total : total + batch_size].cuda()
+        noisy_data = test_noisy_data[total : total + batch_size].cuda()
+        target = test_label[total : total + batch_size].cuda()
+
+        total += batch_size
+        data, target = Variable(data, volatile=True), Variable(target)
+        
+        output, out_features = model.feature_list(data)
+        X_act = []
+        for i in range(num_output):
+            out_features[i] = out_features[i].view(out_features[i].size(0), out_features[i].size(1), -1)
+            out_features[i] = torch.mean(out_features[i].data, 2)
+            X_act.append(np.asarray(out_features[i], dtype=np.float32).reshape((out_features[i].size(0), -1)))
+        
+        output, out_features = model.feature_list(Variable(adv_data, volatile=True))
+        X_act_adv = []
+        for i in range(num_output):
+            out_features[i] = out_features[i].view(out_features[i].size(0), out_features[i].size(1), -1)
+            out_features[i] = torch.mean(out_features[i].data, 2)
+            X_act_adv.append(np.asarray(out_features[i], dtype=np.float32).reshape((out_features[i].size(0), -1)))
+
+        output, out_features = model.feature_list(Variable(noisy_data, volatile=True))
+        X_act_noisy = []
+        for i in range(num_output):
+            out_features[i] = out_features[i].view(out_features[i].size(0), out_features[i].size(1), -1)
+            out_features[i] = torch.mean(out_features[i].data, 2)
+            X_act_noisy.append(np.asarray(out_features[i], dtype=np.float32).reshape((out_features[i].size(0), -1)))
+        
+        # LID
+        list_counter = 0 
+        for overlap in overlap_list:
+            LID_list = []
+            LID_adv_list = []
+            LID_noisy_list = []
+
+            for j in range(num_output):
+                lid_score = mle_batch(X_act[j], X_act[j], k = overlap)
+                lid_score = lid_score.reshape((lid_score.shape[0], -1))
+                lid_adv_score = mle_batch(X_act[j], X_act_adv[j], k = overlap)
+                lid_adv_score = lid_adv_score.reshape((lid_adv_score.shape[0], -1))
+                lid_noisy_score = mle_batch(X_act[j], X_act_noisy[j], k = overlap)
+                lid_noisy_score = lid_noisy_score.reshape((lid_noisy_score.shape[0], -1))
+                
+                LID_list.append(lid_score)
+                LID_adv_list.append(lid_adv_score)
+                LID_noisy_list.append(lid_noisy_score)
+
+            LID_concat = LID_list[0]
+            LID_adv_concat = LID_adv_list[0]
+            LID_noisy_concat = LID_noisy_list[0]
+
+            for i in range(1, num_output):
+                LID_concat = np.concatenate((LID_concat, LID_list[i]), axis=1)
+                LID_adv_concat = np.concatenate((LID_adv_concat, LID_adv_list[i]), axis=1)
+                LID_noisy_concat = np.concatenate((LID_noisy_concat, LID_noisy_list[i]), axis=1)
+                
+            LID[list_counter].extend(LID_concat)
+            LID_adv[list_counter].extend(LID_adv_concat)
+            LID_noisy[list_counter].extend(LID_noisy_concat)
+            list_counter += 1
+            
+    return LID, LID_adv, LID_noisy
+
+def get_resflow_score(test_loader, model, layer, num_classes, net_type, sample_class_mean_layer, flow, magnitude):
+
+    score_vec = []
+    for data, target in test_loader:
+
+        data, target = data.cuda(), target.cuda()
+        data, target = Variable(data, requires_grad = True), Variable(target)
+
+        out_features = model.intermediate_forward(data, layer)
+        out_features = out_features.view(out_features.size(0), out_features.size(1), -1)
+        out_features = torch.mean(out_features, 2)
+
+        # compute score
+        resflow_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_class_mean_layer[i].cuda()
+            zero_f = out_features.data - batch_sample_mean
+            score = flow[i].log_prob(zero_f, training=False)
+            if i == 0:
+                resflow_score = score.view(-1,1)
+            else:
+                resflow_score = torch.cat((resflow_score, score.view(-1,1)), 1)
+
+
+        # Input_processing
+        sample_pred = resflow_score.max(1)[1]
+        pure_score_max = resflow_score.max(1)[0]
+
+
+        pure_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_class_mean_layer[i].cuda()
+            out_features_max = out_features[sample_pred == i ,:]
+            zero_f = out_features_max - batch_sample_mean
+            score = flow[i].log_prob(zero_f, training=False)
+            if i == 0:
+                pure_score = score
+            else:
+                pure_score = torch.cat((pure_score, score), 0)
+
+
+        loss = torch.mean(-pure_score)
+        loss.backward()
+
+
+        gradient =  torch.ge(data.grad.data, 0)
+        gradient = (gradient.float() - 0.5) * 2
+        if net_type == 'densenet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (63.0/255.0))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (62.1/255.0))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (66.7/255.0))
+        elif net_type == 'resnet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (0.2023))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (0.1994))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (0.2010))
+        tempInputs = torch.add(data.data, -magnitude, gradient)
+
+        noise_out_features = model.intermediate_forward(Variable(tempInputs, volatile=True), layer)
+        noise_out_features = noise_out_features.view(noise_out_features.size(0), noise_out_features.size(1), -1)
+        noise_out_features = torch.mean(noise_out_features, 2)
+        noise_resflow_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_class_mean_layer[i].cuda()
+            zero_f = noise_out_features.data - batch_sample_mean
+            pure_score = flow[i].log_prob(zero_f, training=False)
+            if i == 0:
+                noise_resflow_score = pure_score.view(-1,1)
+            else:
+                noise_resflow_score = torch.cat((noise_resflow_score, pure_score.view(-1,1)), 1)
+
+        score_vec.extend(noise_resflow_score.detach().cpu().numpy())
+
+    return score_vec
+
+def get_resflow_score_FGSM(test_loader, model, layer, num_classes, net_type, sample_class_mean_layer, flow, magnitude):
+
+    score_vec = []
+    for data in test_loader:
+
+        data = data.cuda()
+        data = Variable(data, requires_grad = True)
+
+        out_features = model.intermediate_forward(data, layer)
+        out_features = out_features.view(out_features.size(0), out_features.size(1), -1)
+        out_features = torch.mean(out_features, 2)
+
+        # compute score
+        resflow_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_class_mean_layer[i].cuda()
+            zero_f = out_features.data - batch_sample_mean
+            score = flow[i].log_prob(zero_f, training=False)
+            if i == 0:
+                resflow_score = score.view(-1,1)
+            else:
+                resflow_score = torch.cat((resflow_score, score.view(-1,1)), 1)
+
+
+        # Input_processing
+        sample_pred = resflow_score.max(1)[1]
+        pure_score_max = resflow_score.max(1)[0]
+
+        pure_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_class_mean_layer[i].cuda()
+            out_features_max = out_features[sample_pred == i ,:]
+            zero_f = out_features_max - batch_sample_mean
+            score = flow[i].log_prob(zero_f, training=False)
+            if i == 0:
+                pure_score = score
+            else:
+                pure_score = torch.cat((pure_score, score), 0)
+
+
+        loss = torch.mean(-pure_score)
+        loss.backward()
+
+        gradient =  torch.ge(data.grad.data, 0)
+        gradient = (gradient.float() - 0.5) * 2
+        if net_type == 'densenet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (63.0/255.0))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (62.1/255.0))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (66.7/255.0))
+        elif net_type == 'resnet':
+            gradient.index_copy_(1, torch.LongTensor([0]).cuda(), gradient.index_select(1, torch.LongTensor([0]).cuda()) / (0.2023))
+            gradient.index_copy_(1, torch.LongTensor([1]).cuda(), gradient.index_select(1, torch.LongTensor([1]).cuda()) / (0.1994))
+            gradient.index_copy_(1, torch.LongTensor([2]).cuda(), gradient.index_select(1, torch.LongTensor([2]).cuda()) / (0.2010))
+        tempInputs = torch.add(data.data, -magnitude, gradient)
+
+        noise_out_features = model.intermediate_forward(Variable(tempInputs, volatile=True), layer)
+        noise_out_features = noise_out_features.view(noise_out_features.size(0), noise_out_features.size(1), -1)
+        noise_out_features = torch.mean(noise_out_features, 2)
+        noise_resflow_score = 0
+        for i in range(num_classes):
+            batch_sample_mean = sample_class_mean_layer[i].cuda()
+            zero_f = noise_out_features.data - batch_sample_mean
+            pure_score = flow[i].log_prob(zero_f, training=False)
+            if i == 0:
+                noise_resflow_score = pure_score.view(-1,1)
+            else:
+                noise_resflow_score = torch.cat((noise_resflow_score, pure_score.view(-1,1)), 1)
+
+        score_vec.extend(noise_resflow_score.detach().cpu().numpy())
+
+    return score_vec
